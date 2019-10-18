@@ -84,6 +84,8 @@ class EqModel(BaseModel):
             parser.add_argument('--no_flips', action='store_true', default=False)
             parser.add_argument('--sigma_tps', type=float, default=0.005)
             parser.add_argument('--point_tps', type=int, default=5)
+            parser.add_argument('--group_pool', choices=['avg', 'cat'], default='avg')
+
 
         return parser
 
@@ -97,7 +99,11 @@ class EqModel(BaseModel):
         # specify the training losses you want to print out. The training/test scripts will call <BaseModel.get_current_losses>
         self.loss_names = ['D', 'G', 'eq', 'idt']
         # specify the images you want to save/display. The training/test scripts will call <BaseModel.get_current_visuals>
-        visual_names = ['real_A', 'fake', 't_A', 't_fake']
+        visual_names = ['real_A', 'fake']
+        if opt.lambda_eq != 0:
+            visual_names += ['t_A', 't_fake']
+        if opt.lambda_identity != 0:
+            visual_names += ['idt']
         self.visual_names = visual_names
 
         # specify the models you want to save to the disk. The training/test scripts will call <BaseModel.save_networks> and <BaseModel.load_networks>.
@@ -107,7 +113,8 @@ class EqModel(BaseModel):
             self.model_names = ['G']
 
         self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
-                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, group_pool=opt.group_pool)
+        print (self.netG)
 
         if self.isTrain:  # define discriminators
             self.netD = networks.define_D(opt.output_nc, opt.ndf, opt.netD,

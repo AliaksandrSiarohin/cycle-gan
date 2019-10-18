@@ -4,7 +4,6 @@ from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
 
-
 ###############################################################################
 # Helper Functions
 ###############################################################################
@@ -90,7 +89,7 @@ def init_weights(net, init_type='normal', init_gain=0.02):
                 raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
             if hasattr(m, 'bias') and m.bias is not None:
                 init.constant_(m.bias.data, 0.0)
-        elif classname.find('BatchNorm2d') != -1:  # BatchNorm Layer's weight is not a matrix; only normal distribution applies.
+        elif classname.find('BatchNorm') != -1:  # BatchNorm Layer's weight is not a matrix; only normal distribution applies.
             init.normal_(m.weight.data, 1.0, init_gain)
             init.constant_(m.bias.data, 0.0)
 
@@ -149,6 +148,10 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
     if netG == 'resnet_9blocks':
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9)
     elif netG == 'resnet_6blocks':
+        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6)
+    elif netG == 'eq_resnet_9blocks':
+        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9)
+    elif netG == 'eq_resnet_6blocks':
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6)
     elif netG == 'unet_128':
         net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
@@ -613,3 +616,119 @@ class PixelDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.net(input)
+
+
+class EqResnetGenerator(nn.Module):
+    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect', group_pool='avg'):
+        assert(n_blocks >= 0)
+        assert (group_pool in ['avg', 'cat'])
+        super(EqResnetGenerator, self).__init__()
+        from groupy.gconv import P4MConvP4M, P4MConvZ2
+
+
+        if norm_layer == nn.BatchNorm2d:
+            eq_norm_layer = nn.BatchNorm3d
+        else:
+            eq_norm_layer = nn.InstanceNorm3d
+
+        if type(norm_layer) == functools.partial:
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
+
+        model = [nn.ReflectionPad2d(3),
+                 nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
+                 norm_layer(ngf),
+                 nn.ReLU(True)]
+
+        n_downsampling = 2
+        for i in range(n_downsampling):  # add downsampling layers
+            mult = 2 ** i
+            model += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
+                      norm_layer(ngf * mult * 2),
+                      nn.ReLU(True)]
+
+        eq_ngf = int(ngf / np.sqrt(8))
+        mult = 2 ** n_downsampling
+        model += [P4MConvZ2(ngf * mult, eq_ngf * mult, kernel_size=1)]
+ 
+        for i in range(n_blocks):       # add ResNet blocks
+            model += [EqResnetBlock(eq_ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
+
+        model += [GroupPool(), nn.Conv2d(eq_ngf * mult if group_pool != 'cat' else 8 * eq_ngf * mult, ngf * mult, kernel_size=1)]
+ 
+        for i in range(n_downsampling):  # add upsampling layers
+            mult = 2 ** (n_downsampling - i)
+            model += [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2),
+                                         kernel_size=3, stride=2,
+                                         padding=1, output_padding=1,
+                                         bias=use_bias),
+                      norm_layer(int(ngf * mult / 2)),
+                      nn.ReLU(True)]
+        model += [nn.ReflectionPad2d(3)]
+        model += [nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0)]
+        model += [nn.Tanh()]
+
+        self.model = nn.Sequential(*model)
+
+    def forward(self, input):
+        """Standard forward"""
+        return self.model(input)
+
+
+class EqPad(nn.Module):
+    def __init__(self, padding_type):
+        super(EqPad, self).__init__()
+ 
+        if padding_type == 'reflect':
+            self.pad = nn.ReflectionPad2d(1)]
+        elif padding_type == 'replicate':
+            self.pad = nn.ReplicationPad2d(1)
+        elif padding_type == 'zero':
+            self.pad = nn.ZeroPad2d(1)
+        else:
+            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
+
+    def forward(self, x):
+        org_shape = x.shape
+        x = x.view(x.shape[0], -1, x.shape[-2], x.shape[-1])
+        x = self.pad(x)
+        return x.view(*org_shape)
+        
+
+class GroupPool(nn.Module):
+    def __init__(self, padding_type, group_pool):
+        super(GroupPool, self).__init__()
+        self.group_pool = group_pool
+ 
+    def forward(self, x):
+        if self.group_pool == 'avg':
+           return x.mean(dim=2)
+        else:
+           return x.view(x.shape[0], -1, x.shape[-2], x.shape[-1])
+ 
+
+class EqResnetBlock(nn.Module):
+    """Define a Resnet block"""
+
+    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+        super(ResnetBlock, self).__init__()
+        self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
+
+    def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+        from groupy.gconv import P4MConvP4M, P4MConvZ2
+
+        conv_block = [EqPad(padding_type)]
+        conv_block += [P4MConvP4M(dim, dim, kernel_size=3, padding=0, bias=use_bias), norm_layer(dim), nn.ReLU(True)]
+        if use_dropout:
+            conv_block += [nn.Dropout(0.5)]
+        conv_block += [EqPad(padding_type), P4MConvP4M(dim, dim, kernel_size=3, padding=p, bias=use_bias), norm_layer(dim)]
+
+        return nn.Sequential(*conv_block)
+
+    def forward(self, x):
+        """Forward function (with skip connections)"""
+        out = x + self.conv_block(x)  # add skip connections
+        return out
+
+
