@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
+import numpy as np
 
 ###############################################################################
 # Helper Functions
@@ -115,7 +116,7 @@ def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
     return net
 
 
-def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[]):
+def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[], group_pool=None):
     """Create a generator
 
     Parameters:
@@ -150,9 +151,9 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
     elif netG == 'resnet_6blocks':
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6)
     elif netG == 'eq_resnet_9blocks':
-        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9)
+        net = EqResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9, group_pool=group_pool)
     elif netG == 'eq_resnet_6blocks':
-        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6)
+        net = EqResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6, group_pool=group_pool)
     elif netG == 'unet_128':
         net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_256':
@@ -623,7 +624,7 @@ class EqResnetGenerator(nn.Module):
         assert(n_blocks >= 0)
         assert (group_pool in ['avg', 'cat'])
         super(EqResnetGenerator, self).__init__()
-        from groupy.gconv import P4MConvP4M, P4MConvZ2
+        from groupy.gconv.pytorch_gconv import P4MConvP4M, P4MConvZ2
 
 
         if norm_layer == nn.BatchNorm2d:
@@ -653,9 +654,9 @@ class EqResnetGenerator(nn.Module):
         model += [P4MConvZ2(ngf * mult, eq_ngf * mult, kernel_size=1)]
  
         for i in range(n_blocks):       # add ResNet blocks
-            model += [EqResnetBlock(eq_ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
+            model += [EqResnetBlock(eq_ngf * mult, padding_type=padding_type, norm_layer=eq_norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
 
-        model += [GroupPool(), nn.Conv2d(eq_ngf * mult if group_pool != 'cat' else 8 * eq_ngf * mult, ngf * mult, kernel_size=1)]
+        model += [GroupPool(group_pool), nn.Conv2d(eq_ngf * mult if group_pool != 'cat' else 8 * eq_ngf * mult, ngf * mult, kernel_size=1)]
  
         for i in range(n_downsampling):  # add upsampling layers
             mult = 2 ** (n_downsampling - i)
@@ -681,7 +682,7 @@ class EqPad(nn.Module):
         super(EqPad, self).__init__()
  
         if padding_type == 'reflect':
-            self.pad = nn.ReflectionPad2d(1)]
+            self.pad = nn.ReflectionPad2d(1)
         elif padding_type == 'replicate':
             self.pad = nn.ReplicationPad2d(1)
         elif padding_type == 'zero':
@@ -693,11 +694,11 @@ class EqPad(nn.Module):
         org_shape = x.shape
         x = x.view(x.shape[0], -1, x.shape[-2], x.shape[-1])
         x = self.pad(x)
-        return x.view(*org_shape)
+        return x.view(x.shape[0], org_shape[1], org_shape[2], x.shape[-2], x.shape[-1])
         
 
 class GroupPool(nn.Module):
-    def __init__(self, padding_type, group_pool):
+    def __init__(self, group_pool):
         super(GroupPool, self).__init__()
         self.group_pool = group_pool
  
@@ -712,17 +713,17 @@ class EqResnetBlock(nn.Module):
     """Define a Resnet block"""
 
     def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
-        super(ResnetBlock, self).__init__()
+        super(EqResnetBlock, self).__init__()
         self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
 
     def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
-        from groupy.gconv import P4MConvP4M, P4MConvZ2
+        from groupy.gconv.pytorch_gconv import P4MConvP4M, P4MConvZ2
 
         conv_block = [EqPad(padding_type)]
         conv_block += [P4MConvP4M(dim, dim, kernel_size=3, padding=0, bias=use_bias), norm_layer(dim), nn.ReLU(True)]
         if use_dropout:
             conv_block += [nn.Dropout(0.5)]
-        conv_block += [EqPad(padding_type), P4MConvP4M(dim, dim, kernel_size=3, padding=p, bias=use_bias), norm_layer(dim)]
+        conv_block += [EqPad(padding_type), P4MConvP4M(dim, dim, kernel_size=3, padding=0, bias=use_bias), norm_layer(dim)]
 
         return nn.Sequential(*conv_block)
 
